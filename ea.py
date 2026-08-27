@@ -22,18 +22,6 @@ from images import save_as_jpg
 log = logging.getLogger(__name__)
 
 # ── EA API constants ──────────────────────────────────────────────────────────
-# Login page uses ORIGIN_SPA_ID — ORIGIN_JS_SDK direct implicit flow is blocked.
-EA_AUTH_URL = (
-    'https://accounts.ea.com/connect/auth'
-    '?response_type=code'
-    '&client_id=ORIGIN_SPA_ID'
-    '&display=originXWeb%2Flogin'
-    '&locale=en_US'
-    '&release_type=prod'
-    '&redirect_uri=https%3A%2F%2Fwww.origin.com%2Fviews%2Flogin.html'
-)
-_EA_LOGIN_DONE_HOSTS = ('www.origin.com', 'origin.com')
-
 _IDENTITY_URL = 'https://gateway.ea.com/proxy/identity/pids/me'
 _JUNO_API     = 'https://service-aggregation-layer.juno.ea.com/graphql'
 # Supercat used only for single-game metadata rescrape fallback.
@@ -116,38 +104,6 @@ def clear_ea_tokens():
     _save_config_data(data)
 
 
-# ── Auth flow ─────────────────────────────────────────────────────────────────
-
-def get_auth_url():
-    return EA_AUTH_URL
-
-
-def _get_token_silent(cookies_dict):
-    """
-    Exchange browser session cookies for an EA access token using prompt=none.
-    Returns parsed JSON dict on success, None on failure.
-    """
-    try:
-        resp = requests.get(
-            'https://accounts.ea.com/connect/auth',
-            params={
-                'client_id':    'ORIGIN_JS_SDK',
-                'response_type': 'token',
-                'redirect_uri':  'nucleus:rest',
-                'prompt':        'none',
-            },
-            cookies=cookies_dict,
-            headers={'Accept': 'application/json'},
-            timeout=15,
-        )
-        if resp.status_code == 200:
-            return resp.json()
-        log.warning(f'EA silent token exchange HTTP {resp.status_code}: {resp.text[:200]}')
-    except Exception as e:
-        log.warning(f'EA silent token exchange failed: {e}')
-    return None
-
-
 def _save_implicit_token(access_token, expires_in):
     """
     Persist an implicit-grant access token and fetch profile.
@@ -223,142 +179,6 @@ def exchange_code(raw_input):
     if not token or ' ' in token:
         return False, 'Could not extract an access token from the input'
     return _save_implicit_token(token, 3600)
-
-
-# ── Browser-based login (Selenium Chrome) ─────────────────────────────────────
-
-_browser_login_state = {
-    'status': 'idle',   # idle | opening | waiting | success | error | cancelled
-    'message': '',
-    'username': '',
-}
-_browser_login_lock   = threading.Lock()
-_browser_login_cancel = threading.Event()
-_browser_login_driver = None
-
-
-def get_browser_login_state():
-    with _browser_login_lock:
-        return dict(_browser_login_state)
-
-
-def cancel_browser_login():
-    _browser_login_cancel.set()
-    global _browser_login_driver
-    with _browser_login_lock:
-        drv = _browser_login_driver
-    if drv:
-        try:
-            drv.quit()
-        except Exception:
-            pass
-
-
-def start_browser_login():
-    with _browser_login_lock:
-        if _browser_login_state['status'] in ('opening', 'waiting'):
-            return {'status': 'already_running'}
-        _browser_login_cancel.clear()
-        _browser_login_state.update({
-            'status': 'opening', 'message': 'Opening browser...', 'username': '',
-        })
-    threading.Thread(target=_run_browser_login, daemon=True).start()
-    return {'status': 'started'}
-
-
-def _run_browser_login():
-    global _browser_login_driver
-    from selenium import webdriver
-    from selenium.webdriver.chrome.options import Options
-    from selenium.webdriver.chrome.service import Service
-    from urllib.parse import urlparse
-
-    def _set(status, message='', username=''):
-        with _browser_login_lock:
-            _browser_login_state.update({'status': status, 'message': message, 'username': username})
-
-    opts = Options()
-    opts.add_argument('--no-sandbox')
-    opts.add_argument('--disable-dev-shm-usage')
-    opts.add_argument('--window-size=1024,768')
-    opts.add_experimental_option('excludeSwitches', ['enable-automation'])
-    opts.add_experimental_option('useAutomationExtension', False)
-
-    try:
-        svc    = Service()
-        driver = webdriver.Chrome(service=svc, options=opts)
-        driver.execute_cdp_cmd(
-            'Page.addScriptToEvaluateOnNewDocument',
-            {'source': "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"},
-        )
-    except Exception as e:
-        _set('error', f'Could not launch Chrome: {e}')
-        return
-
-    with _browser_login_lock:
-        _browser_login_driver = driver
-
-    try:
-        _set('waiting', 'Log in to EA — this window will close automatically.')
-        driver.get(EA_AUTH_URL)
-
-        deadline = time.time() + 300
-        last_url = ''
-        while time.time() < deadline:
-            if _browser_login_cancel.is_set():
-                _set('cancelled', 'Login cancelled.')
-                return
-
-            try:
-                current = driver.current_url
-            except Exception:
-                _set('error', 'Browser window was closed.')
-                return
-
-            if current != last_url:
-                log.info('EA browser login: URL → %s', current[:200])
-                last_url = current
-
-            # Detect successful login: EA redirects to origin.com/views/login.html
-            try:
-                host = urlparse(current).netloc.lower()
-            except Exception:
-                host = ''
-            if any(host == h or host.endswith('.' + h) for h in _EA_LOGIN_DONE_HOSTS):
-                _set('waiting', 'Exchanging token...')
-                try:
-                    # CDP gives us all cookies from all domains in the session.
-                    all_cookies_data = driver.execute_cdp_cmd('Network.getAllCookies', {})
-                    cookies = {c['name']: c['value'] for c in all_cookies_data.get('cookies', [])}
-                except Exception as e:
-                    log.warning(f'EA browser login: could not get cookies via CDP: {e}')
-                    cookies = {c['name']: c['value'] for c in driver.get_cookies()}
-
-                token_data = _get_token_silent(cookies)
-                if token_data and token_data.get('access_token'):
-                    ok, result = _save_implicit_token(
-                        token_data['access_token'],
-                        token_data.get('expires_in', 3600),
-                    )
-                    if ok:
-                        _set('success', 'Connected successfully.', username=result)
-                    else:
-                        _set('error', result)
-                else:
-                    _set('error', 'Could not retrieve access token — try again.')
-                return
-
-            time.sleep(0.3)
-
-        _set('error', 'Login timed out (5 minutes). Please try again.')
-
-    finally:
-        try:
-            driver.quit()
-        except Exception:
-            pass
-        with _browser_login_lock:
-            _browser_login_driver = None
 
 
 def get_valid_session():
@@ -642,16 +462,17 @@ def _do_sync_library():
 
             next_appid = next_negative_appid(db)
             date_added = entitlement_dates.get(offer_id) or today_ts
+            content_id = detail.get('content_id') or ''
             db.execute(
                 """INSERT OR IGNORE INTO games
-                   (appid, name, platform, platform_id, platform_slug, date_added,
+                   (appid, name, platform, platform_id, platform_slug, platform_appname, date_added,
                     completion_status, installed,
                     art_fetched, meta_fetched, cheevos_fetched,
                     protondb_fetched, hltb_fetched)
-                   VALUES (?, ?, 'ea_app', ?, ?, ?,
+                   VALUES (?, ?, 'ea_app', ?, ?, ?, ?,
                            'Never Played', 0,
                            '0', '0', '0', '0', '0')""",
-                (next_appid, name, offer_id, slug, date_added),
+                (next_appid, name, offer_id, slug, content_id, date_added),
             )
             db.commit()
             log.info(f'EA sync: added {name!r} as appid {next_appid} (offerId {offer_id})')
@@ -914,6 +735,13 @@ def scrape_single(appid):
         meta['name'] = detail['name']
     if detail.get('slug') and not meta.get('platform_slug'):
         meta['platform_slug'] = _resolve_ea_store_slug(detail['slug'])
+    if detail.get('content_id'):
+        # Backfills platform_appname for games synced before this field was
+        # captured -- opportunistic, same as the library sync path; lets
+        # install detection (manifest.find_install_dir_by_content_id) use
+        # the exact content_id match instead of the fuzzier name-based
+        # fallback once a game has been rescraped at least once.
+        meta['platform_appname'] = detail['content_id']
 
     meta['meta_fetched'] = today
     return meta

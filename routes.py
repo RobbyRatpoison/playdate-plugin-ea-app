@@ -1,4 +1,5 @@
 import logging
+import os
 
 from flask import Blueprint, request, jsonify
 from database import get_db, update_game_data
@@ -15,12 +16,6 @@ def ea_status():
     if not is_connected():
         return jsonify({'connected': False, 'username': None})
     return jsonify({'connected': True, 'username': get_display_name()})
-
-
-@bp.route('/auth-url')
-def ea_auth_url():
-    from .ea import get_auth_url
-    return jsonify({'url': get_auth_url()})
 
 
 @bp.route('/token-url')
@@ -70,26 +65,6 @@ def ea_sync_status():
 def ea_sync_cancel():
     from .ea import cancel_library_sync
     cancel_library_sync()
-    return jsonify({'status': 'ok'})
-
-
-@bp.route('/open-browser-login', methods=['POST'])
-def ea_open_browser_login():
-    from .ea import start_browser_login
-    result = start_browser_login()
-    return jsonify(result)
-
-
-@bp.route('/browser-login-status')
-def ea_browser_login_status():
-    from .ea import get_browser_login_state
-    return jsonify(get_browser_login_state())
-
-
-@bp.route('/cancel-browser-login', methods=['POST'])
-def ea_cancel_browser_login():
-    from .ea import cancel_browser_login
-    cancel_browser_login()
     return jsonify({'status': 'ok'})
 
 
@@ -199,6 +174,40 @@ def ea_fix_slugs():
             updated += 1
     log.info(f'EA fix-slugs: checked {len(rows)} games, updated {updated}')
     return jsonify({'status': 'success', 'checked': len(rows), 'updated': updated})
+
+
+def _launcher_config():
+    import json
+    from config import CONFIG_PATH
+    try:
+        with open(CONFIG_PATH, 'r') as f:
+            cfg = json.load(f)
+    except Exception:
+        cfg = {}
+    launcher_cfg = cfg.get('launchers', {}).get('ea_app', {})
+    prefix   = launcher_cfg.get('prefix', '').strip()
+    wine_bin = launcher_cfg.get('wine_bin', '').strip() or None
+    if not wine_bin:
+        from runners.wine import find_proton_wine, find_wine_binary
+        wine_bin = find_proton_wine() or find_wine_binary()
+    return prefix, wine_bin
+
+
+@bp.route('/uninstall/<int:appid>', methods=['POST'])
+def ea_uninstall(appid):
+    from . import plugin
+    result = plugin.uninstall_game(appid)
+    return jsonify(result)
+
+
+@bp.route('/open-games-folder', methods=['POST'])
+def ea_open_games_folder():
+    from runners.installdir import open_folder
+    prefix, _wine_bin = _launcher_config()
+    if not prefix:
+        return jsonify({'status': 'error', 'message': 'No Wine prefix configured'}), 400
+    open_folder(os.path.join(prefix, 'drive_c', 'Program Files', 'EA Games'))
+    return jsonify({'status': 'ok'})
 
 
 @bp.route('/scrape-single/<int:appid>', methods=['POST'])

@@ -39,10 +39,6 @@ def _find_wine_exe(prefix, exe_name):
     return None
 
 
-def _find_wine_launcher_exe(prefix):
-    return _find_wine_exe(prefix, 'EALauncher.exe')
-
-
 def _is_ea_desktop_running():
     """Return True if EALocalHostSvc has bound port 3216 (EA Desktop is up and ready)."""
     import subprocess
@@ -50,15 +46,133 @@ def _is_ea_desktop_running():
     return ':3216' in result.stdout
 
 
-def _wait_for_ea_local_svc(timeout=25):
-    """Poll until EALocalHostSvc binds port 3216, or timeout."""
-    import time
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if _is_ea_desktop_running():
-            return True
-        time.sleep(1)
-    return False
+def _handoff_result(action, message):
+    """
+    A successful hand-off to EA App is not a completed launch/install/
+    uninstall, so it must not be reported as 'status': 'success' -- core's
+    two consumers of this both treat that literally:
+    launchGame() (base.html) only shows the message and skips its
+    post-launch side effects (gamepad suppression, card patch, last-played
+    reorder) for 'installing'/'not_installed'/'error'/'not_supported';
+    doPluginUninstall() (_ctx_menu.html) shows "Game uninstalled" and
+    reloads the page on 'success', for anything else it just shows our
+    message. 'installing' satisfies both (it's in the first set, and isn't
+    literal 'success' for the second) -- it's not a perfect semantic fit
+    for launch/uninstall, but it's the established token other plugins
+    already use for "handed off elsewhere, not done yet", and reusing it
+    beats inventing a one-off status nothing else recognizes.
+    """
+    return {'status': 'installing', 'message': message}
+
+
+def _open_ea_app(action, game_name):
+    """
+    Install, launch, and uninstall for EA games are all the same action
+    from PlayDate's side: open EA App and let the user do it there (same
+    approach Lutris takes). Earlier versions tried to do more -- a
+    from-scratch native downloader, a native LSX launch bypass with
+    OOA/Denuvo licensing, an offerId-keyed origin2:// protocol hand-off to
+    EA Desktop -- and each ran into a launcher-specific dead end (legacy
+    manifests with no resolvable exe; EA Desktop itself rejecting the
+    offerId hand-off for reissued classic titles with a "belongs to
+    another user" error, confirmed live, unrelated to actual ownership).
+    None of that is needed just to get the user in front of their library.
+
+    action is a verb for the returned message ('launch'/'install'/'uninstall').
+    """
+    log.info(f'EA {action}: {game_name!r} -- opening EA App')
+
+    try:
+        if sys.platform == 'win32':
+            native = _find_native_launcher()
+            if not native:
+                return {'status': 'error', 'message': 'EA App not installed'}
+            os.startfile(native)
+        else:  # Linux — Wine (EA App has no macOS version)
+            import json
+            import subprocess as _sp
+            from config import CONFIG_PATH
+            try:
+                with open(CONFIG_PATH, 'r') as f:
+                    cfg = json.load(f)
+            except Exception:
+                cfg = {}
+            launcher_cfg = cfg.get('launchers', {}).get('ea_app', {})
+            prefix   = launcher_cfg.get('prefix', '').strip()
+            wine_bin = launcher_cfg.get('wine_bin', '').strip() or None
+
+            if not prefix:
+                log.warning(f'EA {action}: no Wine prefix configured')
+                return {
+                    'status':  'error',
+                    'message': 'EA App not configured. Open Plugins → Manage to set up Wine.',
+                }
+            if not os.path.isdir(prefix):
+                log.warning(f'EA {action}: prefix does not exist: {prefix!r}')
+                return {
+                    'status':  'error',
+                    'message': f'Wine prefix not found: {prefix}',
+                }
+            from runners.wine import build_proton_env, find_wine_binary, find_proton_wine, is_proton_wine, install_dxvk
+            if not wine_bin:
+                wine_bin = find_proton_wine() or find_wine_binary()
+            if not wine_bin:
+                log.warning(f'EA {action}: no Wine binary found')
+                return {'status': 'error', 'message': 'No Wine or Proton binary found'}
+
+            ea_desktop_exe = _find_wine_exe(prefix, 'EADesktop.exe')
+            if not ea_desktop_exe:
+                log.warning(f'EA {action}: EADesktop.exe not found in prefix {prefix!r}')
+                return {'status': 'error', 'message': 'EA App not installed in Wine prefix'}
+
+            if _is_ea_desktop_running():
+                return _handoff_result(action, f'EA App is already open — {action} "{game_name}" from there.')
+
+            if is_proton_wine(wine_bin):
+                try:
+                    install_dxvk(prefix, wine_bin)
+                except Exception as e:
+                    log.warning(f'EA {action}: DXVK install skipped: {e}')
+
+            env_extra = {
+                'WINEDEBUG':        '-all',
+                # Disable winegstreamer to avoid aborting on unimplemented
+                # winegstreamer_create_color_converter under Wine/Proton.
+                'WINEDLLOVERRIDES': 'winegstreamer=',
+                # DXVK tuning for CEF GPU process stability.
+                'DXVK_ASYNC':       '1',
+                'DXVK_LOG_LEVEL':   'none',
+            }
+            if is_proton_wine(wine_bin):
+                env_extra.update({'WINEFSYNC': '1', 'WINEESYNC': '1'})
+            # Explicitly select NVIDIA Vulkan ICD if available, to ensure
+            # DXVK uses the discrete GPU rather than a software fallback.
+            nvidia_icd = '/usr/share/vulkan/icd.d/nvidia_icd.x86_64.json'
+            if os.path.exists(nvidia_icd):
+                env_extra['VK_ICD_FILENAMES'] = nvidia_icd
+            env = build_proton_env(wine_bin) if is_proton_wine(wine_bin) else dict(os.environ)
+            env['WINEPREFIX'] = prefix
+            env.update(env_extra)
+
+            # Run directly, not wrapped in `wine explorer /desktop=...`
+            # (a Wine virtual-desktop container) -- that wrapping had no
+            # documented reason anywhere in this codebase, and confirmed
+            # live it nests every EA Desktop window inside one big
+            # container window. Running the exe directly lets Wine map
+            # its windows normally.
+            log.info(f'EA {action}: starting EA App')
+            _sp.Popen(
+                [wine_bin, ea_desktop_exe, '-ls=Launcher'],
+                env=env, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+            )
+    except RuntimeError as e:
+        log.error(f'EA {action}: RuntimeError: {e}')
+        return {'status': 'error', 'message': str(e)}
+    except Exception as e:
+        log.error(f'EA {action}: unexpected error: {e}', exc_info=True)
+        return {'status': 'error', 'message': f'Failed to open EA App: {e}'}
+
+    return _handoff_result(action, f'Opening EA App — {action} "{game_name}" from there.')
 
 
 class EAAppPlugin:
@@ -73,25 +187,23 @@ class EAAppPlugin:
         log.info('EA App plugin registered')
 
     def on_startup(self):
-        from .watcher import sync_ea_install_status, start_periodic_sync, start_ea_watcher, _get_install_data_dir
+        from .watcher import sync_ea_install_status, start_ea_watcher, _get_wine_install_base
         try:
             sync_ea_install_status()
             log.info('EA App install status synced on startup')
         except Exception as e:
             log.warning(f'Startup EA App install sync failed: {e}')
-        start_periodic_sync()
         if sys.platform != 'win32':
-            install_data_dir = _get_install_data_dir()
-            if install_data_dir:
-                start_ea_watcher(install_data_dir)
+            install_base = _get_wine_install_base()
+            if install_base:
+                start_ea_watcher(install_base)
 
     def resync_installed(self):
         from .watcher import sync_ea_install_status
         sync_ea_install_status()
 
     def on_shutdown(self):
-        from .watcher import stop_periodic_sync, stop_ea_watcher
-        stop_periodic_sync()
+        from .watcher import stop_ea_watcher
         stop_ea_watcher()
 
     def on_uninstall(self):
@@ -99,12 +211,11 @@ class EAAppPlugin:
         clear_ea_tokens()
 
     def launch_game(self, appid):
-        import time
-        from database import get_db, ts_to_date, update_game_data
+        from database import get_db
 
         db  = get_db()
         row = db.execute(
-            "SELECT name, platform_id, installed FROM games WHERE appid = ?", (appid,)
+            "SELECT name, installed FROM games WHERE appid = ?", (appid,)
         ).fetchone()
         db.close()
 
@@ -112,130 +223,21 @@ class EAAppPlugin:
             log.error(f'EA launch: appid {appid} not found in DB')
             return {'status': 'error', 'message': 'EA game not found'}
 
-        offer_id = (row['platform_id'] or '').strip()
-        if not offer_id:
-            log.error(f'EA launch: appid {appid} ({row["name"]!r}) has no platform_id')
-            return {'status': 'error', 'message': 'Game has no offer ID — try re-syncing'}
+        action = 'launch' if row['installed'] else 'install'
+        return _open_ea_app(action, row['name'])
 
-        installed = bool(row['installed'])
-        if installed:
-            url = f'origin2://game/launch?offerIds={offer_id}&autolaunch=true'
-        else:
-            url = f'origin2://game/install?offerIds={offer_id}'
+    def uninstall_game(self, appid):
+        from database import get_db
 
-        log.info(f'EA launch: appid {appid} ({row["name"]!r}) installed={installed} url={url}')
+        db  = get_db()
+        row = db.execute("SELECT name FROM games WHERE appid = ?", (appid,)).fetchone()
+        db.close()
 
-        try:
-            if sys.platform == 'win32':
-                log.info('EA launch: using os.startfile on Windows')
-                os.startfile(url)
-            else:  # Linux — Wine (EA App has no macOS version)
-                import json
-                import subprocess as _sp
-                from config import CONFIG_PATH
-                try:
-                    with open(CONFIG_PATH, 'r') as f:
-                        cfg = json.load(f)
-                except Exception:
-                    cfg = {}
-                launcher_cfg = cfg.get('launchers', {}).get('ea_app', {})
-                prefix   = launcher_cfg.get('prefix', '').strip()
-                wine_bin = launcher_cfg.get('wine_bin', '').strip() or None
+        if not row:
+            log.error(f'EA uninstall: appid {appid} not found in DB')
+            return {'status': 'error', 'message': 'EA game not found'}
 
-                log.info(f'EA launch: prefix={prefix!r} wine_bin={wine_bin!r}')
-
-                if not prefix:
-                    log.warning('EA launch: no Wine prefix configured')
-                    return {
-                        'status':  'error',
-                        'message': 'EA App not configured. Open Plugins → Manage to set up Wine.',
-                    }
-                if not os.path.isdir(prefix):
-                    log.warning(f'EA launch: prefix does not exist: {prefix!r}')
-                    return {
-                        'status':  'error',
-                        'message': f'Wine prefix not found: {prefix}',
-                    }
-                from runners.wine import build_proton_env, find_wine_binary, find_proton_wine, is_proton_wine, install_dxvk
-                if not wine_bin:
-                    wine_bin = find_proton_wine() or find_wine_binary()
-                    log.info(f'EA launch: auto-detected wine_bin={wine_bin!r}')
-                if not wine_bin:
-                    log.warning('EA launch: no Wine binary found')
-                    return {'status': 'error', 'message': 'No Wine or Proton binary found'}
-
-                ea_desktop_exe   = _find_wine_exe(prefix, 'EADesktop.exe')
-                ea_launch_helper = _find_wine_exe(prefix, 'EALaunchHelper.exe')
-                if not ea_desktop_exe:
-                    log.warning(f'EA launch: EADesktop.exe not found in prefix {prefix!r}')
-                    return {'status': 'error', 'message': 'EA App not installed in Wine prefix'}
-                log.info(f'EA launch: EADesktop={ea_desktop_exe!r} EALaunchHelper={ea_launch_helper!r}')
-
-                if is_proton_wine(wine_bin):
-                    try:
-                        install_dxvk(prefix, wine_bin)
-                    except Exception as e:
-                        log.warning(f'EA launch: DXVK install skipped: {e}')
-
-                env_extra = {
-                    'WINEDEBUG':         '-all',
-                    'EAX_LAUNCH_CLIENT': '0',
-                    # Disable winegstreamer to avoid aborting on unimplemented
-                    # winegstreamer_create_color_converter under Wine/Proton.
-                    'WINEDLLOVERRIDES':  'winegstreamer=',
-                    # DXVK tuning for CEF GPU process stability.
-                    'DXVK_ASYNC':        '1',
-                    'DXVK_LOG_LEVEL':    'none',
-                }
-                if is_proton_wine(wine_bin):
-                    env_extra.update({'WINEFSYNC': '1', 'WINEESYNC': '1'})
-                # Explicitly select NVIDIA Vulkan ICD if available, to ensure
-                # DXVK uses the discrete GPU rather than a software fallback.
-                nvidia_icd = '/usr/share/vulkan/icd.d/nvidia_icd.x86_64.json'
-                if os.path.exists(nvidia_icd):
-                    env_extra['VK_ICD_FILENAMES'] = nvidia_icd
-                env = build_proton_env(wine_bin) if is_proton_wine(wine_bin) else dict(os.environ)
-                env['WINEPREFIX'] = prefix
-                env.update(env_extra)
-
-                if not _is_ea_desktop_running():
-                    log.info('EA launch: EADesktop not running, starting in virtual desktop mode')
-                    _sp.Popen(
-                        [wine_bin, 'explorer', '/desktop=EAApp,1920x1080',
-                         ea_desktop_exe, '-ls=Launcher'],
-                        env=env, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
-                    )
-                    if not _wait_for_ea_local_svc(timeout=25):
-                        log.warning('EA launch: EALocalHostSvc did not bind port 3216 in time')
-                    else:
-                        log.info('EA launch: EADesktop ready (port 3216 bound)')
-
-                # Pass the URL to the running EADesktop instance.
-                if ea_launch_helper:
-                    log.info(f'EA launch: sending URL via EALaunchHelper: {url}')
-                    _sp.Popen([wine_bin, ea_launch_helper, url],
-                              env=env, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
-                else:
-                    launcher_exe = _find_wine_launcher_exe(prefix)
-                    if not launcher_exe:
-                        log.warning('EA launch: neither EALaunchHelper nor EALauncher found')
-                        return {'status': 'error', 'message': 'EA App not installed properly in Wine prefix'}
-                    log.info(f'EA launch: sending URL via EALauncher: {url}')
-                    _sp.Popen([wine_bin, launcher_exe, url],
-                              env=env, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
-        except RuntimeError as e:
-            log.error(f'EA launch: RuntimeError: {e}')
-            return {'status': 'error', 'message': str(e)}
-        except Exception as e:
-            log.error(f'EA launch: unexpected error: {e}', exc_info=True)
-            return {'status': 'error', 'message': f'Launch failed: {e}'}
-
-        if installed:
-            now_ts = int(time.time())
-            update_game_data(appid, last_played=now_ts)
-            return {'status': 'success', 'last_played': ts_to_date(now_ts)}
-
-        return {'status': 'success'}
+        return _open_ea_app('uninstall', row['name'])
 
     def launcher_status(self):
         if sys.platform == 'win32':
@@ -278,13 +280,14 @@ class EAAppPlugin:
 
     def js_api(self):
         return {
-            'uninstall_url':  None,
-            'scrape_url':     '/api/ea_app/scrape-single/{appid}',
-            'scrape_method':  'POST',
-            'store_url':      'https://www.ea.com/games/{slug}',
-            'store_label':    'View on EA App ↗',
-            'appid_label':    'EA Offer ID:',
-            'sync_label':     'Sync EA Library',
+            'uninstall_url':     '/api/ea_app/uninstall/{appid}',
+            'uninstall_confirm': 'Open EA App to uninstall this game? PlayDate does not uninstall EA games directly — you finish it there.',
+            'scrape_url':        '/api/ea_app/scrape-single/{appid}',
+            'scrape_method':     'POST',
+            'store_url':         'https://www.ea.com/games/{slug}',
+            'store_label':       'View on EA App ↗',
+            'appid_label':       'EA Offer ID:',
+            'sync_label':        'Sync EA Library',
         }
 
     def manage_ui(self):
@@ -315,52 +318,69 @@ class EAAppPlugin:
                 ],
             }
 
-        return {
-            'sections': [
-                {
-                    'title': 'Account',
-                    'auth': {
-                        'endpoint': '/api/ea_app/status',
-                        'disconnected': [
-                            {'type': 'text', 'content': 'Connect your EA account to import your library.'},
-                            {'type': 'button', 'label': 'Connect EA Account', 'action': {
-                                'type': 'oauth_paste',
-                                'title': 'Connect EA Account',
-                                'url_endpoint': '/api/ea_app/token-url',
-                                'callback_endpoint': '/api/ea_app/callback',
-                                'instructions': [
-                                    'Click <strong>Open EA Token Page</strong> — your browser opens.',
-                                    'If you are already logged in to EA, you will see a JSON response. Copy the value of <code>access_token</code> and paste it below.',
-                                    'If you are not logged in, sign in at <a href="https://www.ea.com" target="_blank">ea.com</a> first, then click Open again.',
-                                ],
-                                'input_placeholder': 'Paste access_token value here',
-                                'open_label': 'Open EA Token Page',
-                                'submit_label': 'Connect',
-                            }},
-                        ],
-                        'connected': [
-                            {'type': 'connected_label'},
-                            {'type': 'button', 'label': 'Sync Library', 'action': {'type': 'call', 'fn': 'eaSync'}},
-                            {'type': 'button', 'label': 'Disconnect', 'variant': 'muted', 'action': {
-                                'type': 'post', 'endpoint': '/api/ea_app/disconnect',
-                                'on_success': 'refresh_auth',
-                            }},
-                            {'type': 'status_output', 'key': 'main'},
-                        ],
-                    },
-                },
-                launcher_section,
-                {
-                    'title': 'Library',
-                    'items': [
-                        {'type': 'text', 'content': 'Fix store page links for games where the URL does not resolve correctly. Does not require an EA account.'},
-                        {'type': 'button', 'label': 'Fix Store Links', 'action': {
-                            'type': 'call', 'fn': 'eaFixSlugs',
+        sections = [
+            {
+                'title': 'Account',
+                'auth': {
+                    'endpoint': '/api/ea_app/status',
+                    'disconnected': [
+                        {'type': 'text', 'content': 'Connect your EA account to import your library.'},
+                        {'type': 'button', 'label': 'Connect EA Account', 'action': {
+                            'type': 'oauth_paste',
+                            'title': 'Connect EA Account',
+                            'url_endpoint': '/api/ea_app/token-url',
+                            'callback_endpoint': '/api/ea_app/callback',
+                            'instructions': [
+                                'Click <strong>Open EA Token Page</strong> — your browser opens.',
+                                'If you are already logged in to EA, you will see a JSON response. Copy the value of <code>access_token</code> and paste it below.',
+                                'If you are not logged in, sign in at <a href="https://www.ea.com" target="_blank">ea.com</a> first, then click Open again.',
+                            ],
+                            'input_placeholder': 'Paste access_token value here',
+                            'open_label': 'Open EA Token Page',
+                            'submit_label': 'Connect',
                         }},
                     ],
+                    'connected': [
+                        {'type': 'connected_label'},
+                        {'type': 'button', 'label': 'Sync Library', 'action': {'type': 'call', 'fn': 'eaSync'}},
+                        {'type': 'button', 'label': 'Disconnect', 'variant': 'muted', 'action': {
+                            'type': 'post', 'endpoint': '/api/ea_app/disconnect',
+                            'on_success': 'refresh_auth',
+                        }},
+                        {'type': 'status_output', 'key': 'main'},
+                    ],
                 },
+            },
+            launcher_section,
+        ]
+
+        # Games folder button only applies to the Linux native install path
+        # (install_dir lives inside the configured Wine prefix) -- Windows
+        # launch is a plain os.startfile(url) with no PlayDate-managed
+        # install location to open.
+        if sys.platform != 'win32':
+            sections.append({
+                'title': 'Games Folder',
+                'items': [
+                    {'type': 'text', 'content': 'EA games install to EA Games\\ inside the configured Wine prefix.'},
+                    {'type': 'button', 'label': 'Open Folder', 'action': {
+                        'type': 'call', 'fn': 'eaOpenGamesFolder',
+                    }},
+                    {'type': 'status_output', 'key': 'folder'},
+                ],
+            })
+
+        sections.append({
+            'title': 'Library',
+            'items': [
+                {'type': 'text', 'content': 'Fix store page links for games where the URL does not resolve correctly. Does not require an EA account.'},
+                {'type': 'button', 'label': 'Fix Store Links', 'action': {
+                    'type': 'call', 'fn': 'eaFixSlugs',
+                }},
             ],
-        }
+        })
+
+        return {'sections': sections}
 
     date_import_url = 'https://myaccount.ea.com/am/ui/payment-wallet/order-history'
 
@@ -374,8 +394,7 @@ class EAAppPlugin:
 
     def fragments(self):
         return {
-            'base_head_styles': 'ea_app_base_head_styles.html',
-            'tools_scripts':    'ea_app_tools_scripts.html',
+            'tools_scripts': 'ea_app_tools_scripts.html',
         }
 
 

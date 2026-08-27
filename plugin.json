@@ -1,7 +1,8 @@
 {
     "id": "ea_app",
     "name": "EA App",
-    "version": "1.0.0",
+    "version": "1.1.0",
+    "min_core_version": "1.8.2",
     "platform": "ea_app",
     "author": "RobbyRatpoison",
     "source": "github:RobbyRatpoison/playdate-plugin-ea-app",
@@ -14,7 +15,7 @@
             "type": "exe",
             "winearch": "win64",
             "win_version": "win10",
-            "winetricks": ["vcrun2022", "d3dcompiler_47"],
+            "winetricks": ["vcrun2022", "d3dcompiler_47", "corefonts"],
             "env": {"EAX_LAUNCH_CLIENT": "0"},
             "exe_name": "EALauncher.exe",
             "post_install_dlls": [
@@ -22,5 +23,10 @@
                 "lib/vkd3d/x86_64-windows/libvkd3d-shader-1.dll"
             ]
         }
+    },
+    "platform_status": {
+        "windows": "untested",
+        "linux": "working",
+        "mac": "untested"
     }
 }

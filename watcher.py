@@ -1,31 +1,20 @@
 import json
 import logging
 import os
-import sys
-import threading
 
 from runners.watcher import PluginInstallWatcher
 
 log = logging.getLogger(__name__)
 
-# EA App stores install manifests in:
-#   Windows: %PROGRAMDATA%\EA\EA Desktop\InstallData\
-#   Wine:    {prefix}/drive_c/ProgramData/EA/EA Desktop/InstallData/
-_EA_INSTALL_DATA_SUBPATH = os.path.join(
-    'drive_c', 'ProgramData', 'EA', 'EA Desktop', 'InstallData'
-)
+# EA App's own docs describe install manifests living under
+# %PROGRAMDATA%\EA\EA Desktop\InstallData\, but nothing has ever been
+# observed to write there in practice (see manifest.py's module docstring).
+# The reliable per-game location is install_path/platform_executable,
+# stored on the games row itself at install time by download.py (the same
+# generic columns other plugins like GOG already use for this).
 _EA_GAMES_SUBPATH = os.path.join(
     'drive_c', 'Program Files', 'EA Games'
 )
-
-_MANIFEST_DIRS_WINDOWS = [
-    os.path.join(os.environ.get('PROGRAMDATA', r'C:\ProgramData'),
-                 'EA', 'EA Desktop', 'InstallData'),
-]
-
-_POLL_INTERVAL = 30
-_poll_timer    = None
-_poll_lock     = threading.Lock()
 
 
 def _get_wine_prefix():
@@ -38,103 +27,95 @@ def _get_wine_prefix():
         return None
 
 
-def _get_install_data_dir():
-    if sys.platform == 'win32':
-        for d in _MANIFEST_DIRS_WINDOWS:
-            if os.path.isdir(d):
-                return d
-        return None
-    prefix = _get_wine_prefix()
-    return os.path.join(prefix, _EA_INSTALL_DATA_SUBPATH) if prefix else None
-
-
 def _get_wine_install_base():
+    """Real EA Games directory inside the prefix -- unlike InstallData, this
+    one actually receives filesystem events when a game installs/uninstalls."""
     prefix = _get_wine_prefix()
     return os.path.join(prefix, _EA_GAMES_SUBPATH) if prefix else None
 
 
-def _read_installed_offer_ids(install_data_dir):
-    """
-    Parse EA App InstallData manifests to find installed game offerIds.
-    Each subdirectory under InstallData is an offerId; presence = installed.
-    """
-    installed = set()
-    try:
-        for entry in os.scandir(install_data_dir):
-            if not entry.is_dir():
-                continue
-            # Directory name is the offerId
-            offer_id = entry.name.strip()
-            if offer_id:
-                installed.add(offer_id)
-            # Also check for a __Installer or manifest JSON for confirmation
-            manifest = os.path.join(entry.path, 'installerdata.xml')
-            if not os.path.exists(manifest):
-                manifest = os.path.join(entry.path, 'manifest.json')
-            # Directory presence alone is sufficient signal
-    except Exception as e:
-        log.warning(f'EA watcher: could not scan InstallData dir {install_data_dir}: {e}')
-    return installed
-
-
 def sync_ea_install_status():
-    """Update installed flags for all EA App games."""
+    """
+    Verify each EA game's installed flag against install_path/platform_executable
+    (set at install time by download.py's native install path -- see its own
+    comment: "Stored so uninstall_game() ... can find this install later
+    without needing an EA session/content_id API round trip"). This detects
+    both installs AND uninstalls for anything installed through PlayDate
+    itself.
+
+    Games with no stored install_path (installed via the real EA Desktop
+    client directly -- now the default install path, see __init__.py's
+    launch_game -- or pre-existing installs from before this project touched
+    them) are matched two ways, both purely local (registry read + XML
+    parse, no network -- cheap enough to run on every filesystem event):
+
+    1. Exact content_id match (manifest.find_manifest_path_by_content_id)
+       when platform_appname is populated -- the Juno library sync already
+       fetches each game's contentId in the same batch query as its name/
+       art, it just wasn't being persisted before; now stored in
+       platform_appname (same generic column Epic uses for its appName) and
+       backfilled opportunistically by ea.scrape_single() for games synced
+       before this. As precise as the native-launch exe-decision check.
+    2. Fuzzy manifest-<title>/<gameTitle> name match
+       (manifest.find_install_dir_by_name) when no content_id is on record
+       yet. Confirmed live this misses titles where the DB's disambiguated
+       display name (e.g. "SimCity 2000" + a franchise-reboot suffix EA's
+       catalog adds) differs from the manifest's own plainer internal title
+       (e.g. "SimCity 2000 Special Edition") -- a real, accepted gap that
+       content_id backfilling resolves over time as games get rescraped.
+
+    Once matched either way, install_path is backfilled so future watcher
+    events / resync_installed() calls use the cheap direct check above
+    instead of re-scanning every time.
+
+    Called: once at startup (before the watcher attaches), on every
+    filesystem event under the EA Games dir (see _watcher below), and via
+    resync_installed() -- which bulk_rescrape_games() calls for every
+    touched non-Steam platform once metadata (e.g. platform_appname/
+    content_id) has actually changed, since that's not a filesystem event
+    the watcher would ever see.
+    """
     from database import get_db
+    from . import manifest
+
+    prefix = _get_wine_prefix()
 
     db = get_db()
     try:
-        db.execute("UPDATE games SET installed = 0 WHERE platform = 'ea_app'")
-
         rows = db.execute(
-            "SELECT appid, platform_id FROM games WHERE platform = 'ea_app'"
+            "SELECT appid, name, install_path, platform_executable, platform_appname, installed "
+            "FROM games WHERE platform = 'ea_app'"
         ).fetchall()
-        offer_map = {row['platform_id']: row['appid'] for row in rows if row['platform_id']}
+        for row in rows:
+            install_path = row['install_path']
+            exe_rel      = row['platform_executable']
 
-        if not offer_map:
-            db.commit()
-            return
-
-        install_data_dir = _get_install_data_dir()
-        if install_data_dir and os.path.isdir(install_data_dir):
-            installed_ids = _read_installed_offer_ids(install_data_dir)
-            for offer_id, appid in offer_map.items():
-                if offer_id in installed_ids:
-                    db.execute("UPDATE games SET installed = 1 WHERE appid = ?", (appid,))
-
+            if install_path:
+                still_installed = os.path.isdir(install_path)
+                if still_installed and exe_rel:
+                    still_installed = os.path.isfile(os.path.join(install_path, exe_rel))
+                new_flag = 1 if still_installed else 0
+                if new_flag != row['installed']:
+                    db.execute("UPDATE games SET installed = ? WHERE appid = ?", (new_flag, row['appid']))
+            elif prefix and not row['installed']:
+                found = None
+                if row['platform_appname']:
+                    match = manifest.find_manifest_path_by_content_id(prefix, row['platform_appname'])
+                    found = match[0] if match else None
+                    if found:
+                        log.info(f'EA install sync: matched {row["name"]!r} by content_id -> {found}')
+                if not found:
+                    found = manifest.find_install_dir_by_name(prefix, row['name'])
+                    if found:
+                        log.info(f'EA install sync: matched {row["name"]!r} by manifest title -> {found}')
+                if found:
+                    db.execute(
+                        "UPDATE games SET installed = 1, install_path = ? WHERE appid = ?",
+                        (found, row['appid']),
+                    )
         db.commit()
     finally:
         db.close()
-
-
-# ── Periodic polling ──────────────────────────────────────────────────────────
-
-def _schedule_poll():
-    global _poll_timer
-    with _poll_lock:
-        _poll_timer = threading.Timer(_POLL_INTERVAL, _poll_tick)
-        _poll_timer.daemon = True
-        _poll_timer.start()
-
-
-def _poll_tick():
-    try:
-        sync_ea_install_status()
-    except Exception as e:
-        log.warning(f'EA periodic install sync failed: {e}')
-    _schedule_poll()
-
-
-def start_periodic_sync():
-    _schedule_poll()
-    log.info(f'EA App install status polling started (every {_POLL_INTERVAL}s)')
-
-
-def stop_periodic_sync():
-    global _poll_timer
-    with _poll_lock:
-        if _poll_timer:
-            _poll_timer.cancel()
-            _poll_timer = None
 
 
 _watcher = PluginInstallWatcher('ea_app', sync_ea_install_status)

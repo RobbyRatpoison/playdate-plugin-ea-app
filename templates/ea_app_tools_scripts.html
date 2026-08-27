@@ -1,53 +1,5 @@
 // ── EA App ────────────────────────────────────────────────────────────────────
 
-let _eaBrowserLoginPoll = null;
-
-async function eaOpenBrowserLogin() {
-    const st = document.getElementById('ea_app-manage-status-disconnected');
-    if (st) { st.style.color = 'var(--text-secondary)'; st.textContent = 'Opening browser...'; }
-
-    try {
-        const r = await fetch('/api/ea_app/open-browser-login', { method: 'POST' });
-        const d = await r.json();
-        if (d.status === 'already_running') {
-            // already polling, just let it continue
-        } else if (d.status !== 'started') {
-            if (st) { st.style.color = 'var(--text-danger)'; st.textContent = d.message || 'Failed to open browser'; }
-            return;
-        }
-    } catch (e) {
-        if (st) { st.style.color = 'var(--text-danger)'; st.textContent = 'Network error'; }
-        return;
-    }
-
-    if (_eaBrowserLoginPoll) clearInterval(_eaBrowserLoginPoll);
-    _eaBrowserLoginPoll = setInterval(async () => {
-        try {
-            const r = await fetch('/api/ea_app/browser-login-status');
-            const d = await r.json();
-            if (st) {
-                if (d.status === 'error' || d.status === 'cancelled') {
-                    st.style.color = 'var(--text-danger)';
-                } else if (d.status === 'success') {
-                    st.style.color = 'var(--accent-positive, #5c7e10)';
-                } else {
-                    st.style.color = 'var(--text-secondary)';
-                }
-                st.textContent = d.message || '';
-            }
-            if (d.status === 'success' || d.status === 'error' || d.status === 'cancelled' || d.status === 'idle') {
-                clearInterval(_eaBrowserLoginPoll);
-                _eaBrowserLoginPoll = null;
-                if (d.status === 'success') {
-                    setTimeout(() => _manageRefreshAuth('ea_app'), 800);
-                }
-            }
-        } catch (_) {}
-    }, 750);
-}
-
-
-
 let _eaSyncPollInterval = null;
 
 function _eaSyncStatusText(d) {
@@ -160,5 +112,16 @@ async function eaFixSlugs() {
         }
     } catch (e) {
         if (btn) { btn.textContent = 'Error'; setTimeout(() => { btn.disabled = false; btn.textContent = 'Fix Store Links'; }, 3000); }
+    }
+}
+
+async function eaOpenGamesFolder() {
+    const st = document.getElementById('ea_app-manage-status-folder');
+    try {
+        const r = await fetch('/api/ea_app/open-games-folder', { method: 'POST' });
+        const d = await r.json();
+        if (d.status !== 'ok' && st) st.textContent = d.message || 'Failed to open folder';
+    } catch (e) {
+        if (st) st.textContent = 'Network error';
     }
 }
