@@ -346,6 +346,50 @@ _sync_lock   = threading.Lock()
 _sync_cancel = threading.Event()
 
 
+def _cleanup_offerid_duplicates():
+    """Collapse ea_app rows that are the same game imported under two different
+    EA offerIds (see the seen_content note in _do_sync_library). Keeps the
+    first-imported row (least-negative appid -- matches which one the import
+    loop's skip logic would keep) and only removes an extra row that's still
+    an untouched phantom -- no playtime, default status, not installed -- so a
+    row the user has actually engaged with is never dropped. Self-heals
+    installs that synced before this dedup existed."""
+    from database import get_db
+    db = get_db()
+    try:
+        rows = db.execute(
+            """SELECT appid, platform_appname, platform_slug,
+                      COALESCE(playtime_forever, 0) AS pt,
+                      COALESCE(completion_status, 'Never Played') AS cs,
+                      COALESCE(installed, 0) AS inst
+               FROM games WHERE platform = 'ea_app'"""
+        ).fetchall()
+        groups = {}
+        for r in rows:
+            key = ('c', r['platform_appname']) if r['platform_appname'] else \
+                  (('s', r['platform_slug']) if r['platform_slug'] else None)
+            if key:
+                groups.setdefault(key, []).append(r)
+        removed = 0
+        for key, members in groups.items():
+            if len(members) < 2:
+                continue
+            members.sort(key=lambda r: r['appid'], reverse=True)  # least-negative = imported first
+            for extra in members[1:]:
+                if extra['pt'] == 0 and extra['cs'] == 'Never Played' and extra['inst'] == 0:
+                    db.execute("DELETE FROM games WHERE appid = ?", (extra['appid'],))
+                    removed += 1
+                    log.info(f'EA sync: removed duplicate row appid {extra["appid"]} '
+                             f'(same {key[0]}={key[1]} as appid {members[0]["appid"]})')
+        if removed:
+            db.commit()
+            log.info(f'EA sync: cleaned up {removed} duplicate offerId row(s)')
+    except Exception as e:
+        log.warning(f'EA sync: duplicate cleanup failed: {e}')
+    finally:
+        db.close()
+
+
 def get_sync_state():
     with _sync_lock:
         return dict(_sync_state)
@@ -408,9 +452,16 @@ def _do_sync_library():
     db = get_db()
     try:
         existing_rows = db.execute(
-            "SELECT appid, platform_id FROM games WHERE platform = 'ea_app'"
+            "SELECT appid, platform_id, platform_appname, platform_slug FROM games WHERE platform = 'ea_app'"
         ).fetchall()
         existing    = {row['platform_id'] for row in existing_rows}
+        # EA grants multiple offerIds for one game -- a legacy OFB-EAST SKU and
+        # a reissued Origin.OFR one, both flagged BASE_GAME. Dedup on the stable
+        # content_id (stored in platform_appname), falling back to the slug, so
+        # a second offerId for a game already in the library is skipped instead
+        # of imported as a phantom duplicate.
+        seen_content = {r['platform_appname'] for r in existing_rows if r['platform_appname']}
+        seen_slugs   = {r['platform_slug'] for r in existing_rows if r['platform_slug']}
         blacklisted = {row[0] for row in db.execute(
             "SELECT platform_id FROM blacklist WHERE platform_id IS NOT NULL"
         ).fetchall()}
@@ -453,16 +504,29 @@ def _do_sync_library():
                                         'new_games': new_games_count, 'total_games': len(offer_ids)})
                 return
 
-            detail = detail_map.get(offer_id) or {}
-            name   = detail.get('name') or offer_id
-            slug   = detail.get('slug') or ''
+            detail     = detail_map.get(offer_id) or {}
+            name       = detail.get('name') or offer_id
+            slug       = detail.get('slug') or ''
+            content_id = detail.get('content_id') or ''
+
+            # Skip a game already imported under a different offerId.
+            if (content_id and content_id in seen_content) or \
+               (not content_id and slug and slug in seen_slugs):
+                log.info(f'EA sync: skipping {name!r} (offerId {offer_id}) -- already in library '
+                         f'(content_id {content_id or "-"}, slug {slug or "-"})')
+                with _sync_lock:
+                    _sync_state['done'] += 1
+                continue
+            if content_id:
+                seen_content.add(content_id)
+            if slug:
+                seen_slugs.add(slug)
 
             with _sync_lock:
                 _sync_state['current_game'] = name
 
             next_appid = next_negative_appid(db)
             date_added = entitlement_dates.get(offer_id) or today_ts
-            content_id = detail.get('content_id') or ''
             db.execute(
                 """INSERT OR IGNORE INTO games
                    (appid, name, platform, platform_id, platform_slug, platform_appname, date_added,
@@ -505,6 +569,8 @@ def _do_sync_library():
             time.sleep(0.3)
     finally:
         db.close()
+
+    _cleanup_offerid_duplicates()
 
     try:
         from .watcher import sync_ea_install_status

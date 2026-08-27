@@ -1,7 +1,7 @@
 {
     "id": "ea_app",
     "name": "EA App",
-    "version": "1.1.0",
+    "version": "1.1.1",
     "min_core_version": "1.8.2",
     "platform": "ea_app",
     "author": "RobbyRatpoison",
