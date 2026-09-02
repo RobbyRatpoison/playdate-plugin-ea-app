@@ -34,6 +34,32 @@ def _get_wine_install_base():
     return os.path.join(prefix, _EA_GAMES_SUBPATH) if prefix else None
 
 
+def _install_present(install_path, exe_rel=None):
+    """Whether an EA game is *actually* installed at install_path -- not just
+    whether the directory still exists.
+
+    EA's Cleanup.exe removes the game payload and the __Installer/ metadata
+    dir on uninstall, but routinely leaves the top-level game folder in place
+    afterwards -- as an empty shell (just game.ico) or leftover DRM-activation
+    stubs. A bare os.path.isdir() check therefore reports these classic titles
+    as installed forever; confirmed for Bejeweled 3, Crusader: No Remorse,
+    SimCity 2000, Syndicate (1993) and Theme Hospital.
+
+    Positive signals, strongest first:
+      1. the recorded platform_executable still exists;
+      2. __Installer/installerdata.xml exists -- EA's own canonical "installed"
+         artifact (see manifest.py: both install-dir matchers require it),
+         which Cleanup.exe deletes.
+    Absence of both means uninstalled.
+    """
+    if not install_path or not os.path.isdir(install_path):
+        return False
+    if exe_rel and os.path.isfile(os.path.join(install_path, exe_rel)):
+        return True
+    from .manifest import _case_insensitive_join
+    return os.path.isfile(_case_insensitive_join(install_path, '__Installer/installerdata.xml'))
+
+
 def sync_ea_install_status():
     """
     Verify each EA game's installed flag against install_path/platform_executable
@@ -91,12 +117,16 @@ def sync_ea_install_status():
             exe_rel      = row['platform_executable']
 
             if install_path:
-                still_installed = os.path.isdir(install_path)
-                if still_installed and exe_rel:
-                    still_installed = os.path.isfile(os.path.join(install_path, exe_rel))
+                still_installed = _install_present(install_path, exe_rel)
                 new_flag = 1 if still_installed else 0
                 if new_flag != row['installed']:
                     db.execute("UPDATE games SET installed = ? WHERE appid = ?", (new_flag, row['appid']))
+                if not still_installed:
+                    # Drop the stale path so the manifest-name re-match branch
+                    # below can re-detect a later reinstall (EA may put it in a
+                    # different dir). The leftover shell Cleanup.exe leaves
+                    # behind has no installerdata.xml, so it won't re-match.
+                    db.execute("UPDATE games SET install_path = NULL WHERE appid = ?", (row['appid'],))
             elif prefix and not row['installed']:
                 found = None
                 if row['platform_appname']:
@@ -118,7 +148,15 @@ def sync_ea_install_status():
         db.close()
 
 
-_watcher = PluginInstallWatcher('ea_app', sync_ea_install_status)
+# recursive + file events: EA's Cleanup.exe uninstalls a classic title by
+# gutting its game folder (removing __Installer/ and the payload) while
+# leaving the now-empty folder in place -- a top-level directory-only watch
+# never sees that. debounce coalesces the event storm from a game
+# install/uninstall into one sync once the filesystem settles.
+_watcher = PluginInstallWatcher(
+    'ea_app', sync_ea_install_status,
+    recursive=True, watch_files=True, debounce_seconds=1.5,
+)
 
 
 def start_ea_watcher(watch_path: str):
