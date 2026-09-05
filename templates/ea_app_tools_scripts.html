@@ -115,6 +115,20 @@ async function eaFixSlugs() {
     }
 }
 
+async function eaStartLauncher() {
+    const btn = document.querySelector('button[onclick="eaStartLauncher()"]');
+    if (btn) { btn.disabled = true; btn.textContent = 'Starting…'; }
+    try {
+        const r = await fetch('/api/ea_app/start-launcher', { method: 'POST' });
+        const d = await r.json();
+        if (btn) btn.textContent = d.status === 'success' ? 'Started' : (d.message || 'Failed');
+    } catch (e) {
+        if (btn) btn.textContent = 'Failed';
+    } finally {
+        setTimeout(() => { if (btn) { btn.disabled = false; btn.textContent = 'Start Launcher'; } }, 3000);
+    }
+}
+
 async function eaOpenGamesFolder() {
     const st = document.getElementById('ea_app-manage-status-folder');
     try {

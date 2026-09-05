@@ -7,16 +7,23 @@ log = logging.getLogger(__name__)
 
 def _find_native_launcher():
     """Return path to EADesktop.exe on Windows, or None."""
-    if sys.platform == 'win32':
-        candidates = []
-        for env in ('PROGRAMFILES', 'PROGRAMFILES(X86)', 'PROGRAMW6432', 'LOCALAPPDATA'):
-            base = os.environ.get(env, '')
-            if base:
-                candidates.append(os.path.join(base, 'Electronic Arts', 'EA Desktop', 'EADesktop.exe'))
-                candidates.append(os.path.join(base, 'EA Desktop', 'EADesktop.exe'))
-        for path in candidates:
-            if os.path.isfile(path):
-                return path
+    if sys.platform != 'win32':
+        return None
+    from runners.windows import find_installed_exe
+    exe = find_installed_exe('EA app', 'EADesktop.exe')
+    if exe:
+        return exe
+    # Fallback: standard install-path guesses, in case the registry
+    # DisplayName doesn't match ('EA app' vs an older 'EA Desktop' release).
+    candidates = []
+    for env in ('PROGRAMFILES', 'PROGRAMFILES(X86)', 'PROGRAMW6432', 'LOCALAPPDATA'):
+        base = os.environ.get(env, '')
+        if base:
+            candidates.append(os.path.join(base, 'Electronic Arts', 'EA Desktop', 'EADesktop.exe'))
+            candidates.append(os.path.join(base, 'EA Desktop', 'EADesktop.exe'))
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
     return None
 
 
@@ -40,9 +47,19 @@ def _find_wine_exe(prefix, exe_name):
 
 
 def _is_ea_desktop_running():
-    """Return True if EALocalHostSvc has bound port 3216 (EA Desktop is up and ready)."""
-    import subprocess
-    result = subprocess.run(['ss', '-tlnp'], capture_output=True, text=True)
+    """Return True if EALocalHostSvc has bound port 3216 (EA Desktop is up and ready).
+
+    ss lives on the host, not inside the Flatpak sandbox -- route through
+    host_run like every other process/prefix check in the codebase, or this
+    raises FileNotFoundError under Flatpak every time it's called (confirmed
+    live 2026-09-04: broke Start Launcher outright, and would equally have
+    broken this "already open, hand off there" check during launch/uninstall)."""
+    from runners.sandbox import host_run
+    try:
+        result = host_run(['ss', '-tlnp'], capture_output=True, text=True)
+    except Exception as e:
+        log.warning(f'EA: _is_ea_desktop_running check failed: {e}')
+        return False
     return ':3216' in result.stdout
 
 
@@ -90,7 +107,6 @@ def _open_ea_app(action, game_name):
             os.startfile(native)
         else:  # Linux — Wine (EA App has no macOS version)
             import json
-            import subprocess as _sp
             from config import CONFIG_PATH
             try:
                 with open(CONFIG_PATH, 'r') as f:
@@ -113,7 +129,7 @@ def _open_ea_app(action, game_name):
                     'status':  'error',
                     'message': f'Wine prefix not found: {prefix}',
                 }
-            from runners.wine import build_proton_env, find_wine_binary, find_proton_wine, is_proton_wine, install_dxvk
+            from runners.wine import find_wine_binary, find_proton_wine, is_proton_wine, install_dxvk, run_in_prefix
             if not wine_bin:
                 wine_bin = find_proton_wine() or find_wine_binary()
             if not wine_bin:
@@ -150,9 +166,6 @@ def _open_ea_app(action, game_name):
             nvidia_icd = '/usr/share/vulkan/icd.d/nvidia_icd.x86_64.json'
             if os.path.exists(nvidia_icd):
                 env_extra['VK_ICD_FILENAMES'] = nvidia_icd
-            env = build_proton_env(wine_bin) if is_proton_wine(wine_bin) else dict(os.environ)
-            env['WINEPREFIX'] = prefix
-            env.update(env_extra)
 
             # Run directly, not wrapped in `wine explorer /desktop=...`
             # (a Wine virtual-desktop container) -- that wrapping had no
@@ -160,11 +173,20 @@ def _open_ea_app(action, game_name):
             # live it nests every EA Desktop window inside one big
             # container window. Running the exe directly lets Wine map
             # its windows normally.
+            #
+            # Goes through run_in_prefix -- not a raw subprocess.Popen(
+            # [wine_bin, ...]) -- so Proton gets wrapped in umu-run (a bare
+            # Proton wine_bin can't run anything standalone, see CLAUDE.md)
+            # and, under Flatpak, the process actually starts on the host
+            # instead of inside the sandbox. Confirmed live 2026-09-04: the
+            # raw-Popen version silently launched-and-died with no error
+            # (stdout/stderr went to DEVNULL) every time this ran under the
+            # Flatpak build with a Proton wine_bin -- it had never been
+            # exercised before because the _is_ea_desktop_running() ss bug
+            # above (now also fixed) always failed first.
             log.info(f'EA {action}: starting EA App')
-            _sp.Popen(
-                [wine_bin, ea_desktop_exe, '-ls=Launcher'],
-                env=env, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
-            )
+            run_in_prefix(prefix, ea_desktop_exe, args=['-ls=Launcher'],
+                          wine_bin=wine_bin, env_extra=env_extra)
     except RuntimeError as e:
         log.error(f'EA {action}: RuntimeError: {e}')
         return {'status': 'error', 'message': str(e)}
@@ -239,6 +261,12 @@ class EAAppPlugin:
 
         return _open_ea_app('uninstall', row['name'])
 
+    def start_launcher(self):
+        """Open EA App with no specific game -- same underlying open as
+        launch/install/uninstall (action/game_name only affect the log
+        message), exposed directly for reaching the app on its own."""
+        return _open_ea_app('start', 'EA App')
+
     def launcher_status(self):
         if sys.platform == 'win32':
             native = _find_native_launcher()
@@ -297,6 +325,9 @@ class EAAppPlugin:
                 'title': 'Launcher',
                 'items': [
                     {'type': 'text', 'content': 'EA App is installed — no additional setup needed.'},
+                    {'type': 'button', 'label': 'Start Launcher', 'action': {
+                        'type': 'call', 'fn': 'eaStartLauncher',
+                    }},
                 ],
             }
         elif sys.platform == 'win32':
@@ -310,13 +341,26 @@ class EAAppPlugin:
                 ],
             }
         else:
-            launcher_section = {
-                'title': 'Launcher',
-                'items': [
-                    {'type': 'text', 'content': 'Set the Wine binary and prefix where EA App is installed.'},
-                    {'type': 'launcher_config'},
-                ],
-            }
+            items = [
+                {'type': 'text', 'content': 'Set the Wine binary and prefix where EA App is installed.'},
+                {'type': 'launcher_config'},
+            ]
+            import json
+            from config import CONFIG_PATH
+            try:
+                with open(CONFIG_PATH, 'r') as f:
+                    cfg = json.load(f)
+            except Exception:
+                cfg = {}
+            prefix = (cfg.get('launchers', {}).get('ea_app', {}).get('prefix') or '').strip()
+            if prefix and _find_wine_exe(prefix, 'EADesktop.exe'):
+                items.append({'type': 'text', 'content':
+                              'EA App is installed. Use "Start Launcher" to open it directly -- useful to '
+                              'check for updates or browse the library there.'})
+                items.append({'type': 'button', 'label': 'Start Launcher', 'action': {
+                    'type': 'call', 'fn': 'eaStartLauncher',
+                }})
+            launcher_section = {'title': 'Launcher', 'items': items}
 
         sections = [
             {

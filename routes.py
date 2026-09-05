@@ -200,6 +200,12 @@ def ea_uninstall(appid):
     return jsonify(result)
 
 
+@bp.route('/start-launcher', methods=['POST'])
+def ea_start_launcher():
+    from . import plugin
+    return jsonify(plugin.start_launcher())
+
+
 @bp.route('/open-games-folder', methods=['POST'])
 def ea_open_games_folder():
     from runners.installdir import open_folder
