@@ -592,6 +592,33 @@ def _do_sync_library():
 
 # ── Art download ──────────────────────────────────────────────────────────────
 
+def art_urls(appid):
+    """EA's own art for core's Artwork Sources "Store" option: the Juno CDN
+    {'vertical': url, 'horizontal': url} the sync uses, any subset. {} when not
+    connected or EA has none for this offer."""
+    if not is_connected():
+        return {}
+    session = get_valid_session()
+    if not session:
+        return {}
+    from database import get_db
+    db  = get_db()
+    row = db.execute(
+        "SELECT platform_id FROM games WHERE appid = ? AND platform = 'ea_app'", (appid,)
+    ).fetchone()
+    db.close()
+    if not row or not row['platform_id']:
+        return {}
+    detail_list = _fetch_games_detail(session, [row['platform_id']])
+    detail = detail_list[0] if detail_list else {}
+    urls = {}
+    if detail.get('vert_url'):
+        urls['vertical'] = detail['vert_url']
+    if detail.get('horiz_url'):
+        urls['horizontal'] = detail['horiz_url']
+    return urls
+
+
 def _download_art_from_urls(appid, vert_url, horiz_url, name=''):
     """
     Download art for an EA game. Tries SGDB first (by name), falls back to Juno CDN URLs.

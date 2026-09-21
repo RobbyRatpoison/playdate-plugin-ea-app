@@ -436,6 +436,14 @@ class EAAppPlugin:
         from .ea import scrape_single
         return scrape_single(appid) or None
 
+    art_kinds = ('vertical', 'horizontal')
+    # EA's own sync tries SteamGridDB first and its CDN as the fallback; keep that.
+    art_default_order = ('sgdb', 'store', 'steam')
+
+    def art_urls(self, appid):
+        from .ea import art_urls
+        return art_urls(appid)
+
     def fragments(self):
         return {
             'tools_scripts': 'ea_app_tools_scripts.html',
