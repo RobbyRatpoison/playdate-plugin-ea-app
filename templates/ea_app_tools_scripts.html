@@ -27,6 +27,25 @@ function _eaSetSyncRunning(running) {
     }
 }
 
+async function eaImportDates() {
+    const st = document.getElementById('ea_app-manage-status-main');
+    if (!st) return;
+    st.style.color = 'var(--text-secondary)';
+    st.textContent = 'Reading EA entitlements...';
+    try {
+        const r = await fetch('/api/ea_app/import-purchase-dates', { method: 'POST' });
+        const d = await r.json();
+        if (d.status !== 'success') { st.style.color = 'var(--text-danger)'; st.textContent = d.message || 'Failed'; return; }
+        let msg = `Done — ${d.updated} date${d.updated !== 1 ? 's' : ''} imported`;
+        if (d.missing) msg += `, ${d.missing} game${d.missing !== 1 ? 's' : ''} without a date`;
+        st.style.color = 'var(--accent)';
+        st.textContent = msg;
+    } catch (e) {
+        st.style.color = 'var(--text-danger)';
+        st.textContent = 'Network error';
+    }
+}
+
 async function eaStopSync() {
     const st = document.getElementById('ea_app-manage-status-main');
     if (st) { st.style.color = 'var(--text-secondary)'; st.textContent = 'Stopping...'; }

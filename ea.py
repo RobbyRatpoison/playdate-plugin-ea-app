@@ -11,8 +11,10 @@ Library sync uses the Juno GraphQL API (service-aggregation-layer.juno.ea.com).
 import json
 import logging
 import os
+import re
 import threading
 import time
+from datetime import datetime, timezone
 
 import requests
 from config import BASE_DIR, load_config, _save_config_data
@@ -90,7 +92,15 @@ def load_ea_tokens():
 
 
 def is_connected():
-    return load_ea_tokens() is not None
+    """Connected means a token that has not expired. The implicit-flow token has no
+    refresh token and lasts about 4 hours, so an expired one is a dead connection
+    (the card then shows Connect again). The stale token stays until reconnect."""
+    tokens = load_ea_tokens()
+    if not tokens:
+        return False
+    if tokens.get('refresh_token'):
+        return True
+    return int(time.time()) < tokens.get('expires_at', 0) - 60
 
 
 def get_display_name():
@@ -109,6 +119,15 @@ def _save_implicit_token(access_token, expires_in):
     Persist an implicit-grant access token and fetch profile.
     Returns (True, display_name) on success, (False, error_msg) on failure.
     """
+    # EA reports the token's true remaining life (about 4 h); a pasted token carries
+    # no expiry, so ask rather than guess.
+    try:
+        ti = requests.get('https://accounts.ea.com/connect/tokeninfo',
+                          params={'access_token': access_token}, timeout=10)
+        if ti.status_code == 200 and ti.json().get('expires_in'):
+            expires_in = int(ti.json()['expires_in'])
+    except Exception as e:
+        log.debug(f'EA auth: tokeninfo failed: {e}')
     expires_at   = int(time.time()) + int(expires_in or 3600)
     display_name = ''
     pid          = ''
@@ -119,12 +138,18 @@ def _save_implicit_token(access_token, expires_in):
                      'X-Expand-Results': 'true'},
             timeout=10,
         )
+        if r.status_code in (400, 401, 403):
+            return False, ('EA rejected that token. Make sure you are signed in to ea.com, '
+                           'open the token page again and paste the access_token it shows')
         if r.status_code == 200:
             profile      = r.json().get('pid', {})
             display_name = profile.get('displayName', '')
             pid          = str(profile.get('pidId', ''))
     except Exception as e:
         log.warning(f'EA auth: could not fetch profile: {e}')
+        return False, 'Could not reach EA to verify the token. Check your connection and try again'
+    if not pid:
+        return False, 'EA did not recognise that token. Paste the access_token value from the token page'
 
     # Identity endpoint omits displayName; fetch it via the personas endpoint.
     if not display_name and pid:
@@ -162,23 +187,43 @@ def _save_implicit_token(access_token, expires_in):
     return True, display_name or 'EA Account'
 
 
-def exchange_code(raw_input):
-    """
-    Accept a raw token string pasted by the user (fallback manual path).
-    Returns (True, display_name) on success, (False, error_msg) on failure.
-    """
-    raw = (raw_input or '').strip()
-    # Accept bare access token or JSON {"access_token": "..."}
-    token = raw
+def _parse_token_input(raw):
+    """Pull (access_token, expires_in) out of whatever the user pasted: a bare
+    token, the JSON EA's token page shows ({"access_token": ...}), or the redirect
+    URL / fragment form (nucleus:rest#access_token=...&expires_in=...). Returns
+    (None, None) when no token is found; expires_in is None when not given."""
+    raw = (raw or '').strip().strip('"\'')
     if raw.startswith('{'):
         try:
-            obj   = json.loads(raw)
-            token = obj.get('access_token') or ''
+            obj = json.loads(raw)
+            tok = obj.get('access_token') or ''
+            return (tok or None), obj.get('expires_in')
         except Exception:
             pass
-    if not token or ' ' in token:
+    m = re.search(r'(?:^|[#?&\s"])access_token=([^&\s"\']+)', raw)
+    if m:
+        exp = re.search(r'(?:^|[#?&\s])expires_in=(\d+)', raw)
+        return m.group(1), (int(exp.group(1)) if exp else None)
+    m = re.search(r'"access_token"\s*:\s*"([^"]+)"', raw)
+    if m:
+        return m.group(1), None
+    if raw and not re.search(r'\s', raw) and not re.search(r'[={}:/?]', raw):
+        return raw, None
+    return None, None
+
+
+def exchange_code(raw_input):
+    """
+    Accept a pasted token in any of the formats _parse_token_input understands.
+    Returns (True, display_name) on success, (False, error_msg) on failure.
+    """
+    token, expires_in = _parse_token_input(raw_input)
+    if not token:
+        if 'login_required' in (raw_input or ''):
+            return False, ('EA says you are not signed in. Sign in at ea.com in the same '
+                           'browser first, then open the token page again')
         return False, 'Could not extract an access token from the input'
-    return _save_implicit_token(token, 3600)
+    return _save_implicit_token(token, expires_in or 3600)
 
 
 def get_valid_session():
@@ -332,8 +377,38 @@ def _fetch_games_detail(session, offer_ids, chunk_size=100):
 # ── Entitlement dates ─────────────────────────────────────────────────────────
 
 def _fetch_entitlement_dates(session, pid):
-    """EA's entitlements REST API is not accessible via the implicit-flow token. Returns {}."""
-    return {}
+    """{offer_id: earliest grant timestamp} from EA's identity gateway, which lists
+    every entitlement with its grantDate and productId in one call (the old
+    Origin REST endpoints are gone). A grant date is when EA added the game to the
+    account: close to the purchase date, later for a pre-order (unlocked at
+    release) or a re-granted old title. Returns {} on any failure."""
+    if not pid:
+        return {}
+    try:
+        resp = session.get(
+            f'https://gateway.ea.com/proxy/identity/pids/{pid}/entitlements',
+            headers={'X-Expand-Results': 'true'}, timeout=40,
+        )
+        resp.raise_for_status()
+        ents = (resp.json().get('entitlements') or {}).get('entitlement') or []
+    except Exception as e:
+        log.warning(f'EA entitlement dates: request failed: {e}')
+        return {}
+    if isinstance(ents, dict):
+        ents = [ents]
+    out = {}
+    for e in ents:
+        offer, granted = e.get('productId'), e.get('grantDate')
+        if not offer or not granted or e.get('status') != 'ACTIVE':
+            continue
+        try:
+            ts = int(datetime.strptime(granted, '%Y-%m-%dT%H:%MZ')
+                     .replace(tzinfo=timezone.utc).timestamp())
+        except ValueError:
+            continue
+        if offer not in out or ts < out[offer]:
+            out[offer] = ts
+    return out
 
 
 # ── Library sync ──────────────────────────────────────────────────────────────
@@ -422,6 +497,34 @@ def _run_sync_library():
             _sync_state.update({'running': False, 'phase': 'error', 'error': str(e)})
 
 
+def import_purchase_dates():
+    """Overwrite date_added with the EA grant date for every EA game in the library.
+    Returns {'updated': n, 'missing': n} or None when not connected / the request
+    failed. Sync only dates newly added games; this is the explicit re-import."""
+    from database import get_db, update_game_data
+    session = get_valid_session()
+    if not session:
+        return None
+    dates = _fetch_entitlement_dates(session, _get_pid())
+    if not dates:
+        return None
+    db = get_db()
+    try:
+        rows = db.execute("SELECT appid, platform_id FROM games WHERE platform = 'ea_app'").fetchall()
+    finally:
+        db.close()
+    updated = missing = 0
+    for r in rows:
+        ts = dates.get(r['platform_id'])
+        if ts is None:
+            missing += 1
+            continue
+        update_game_data(r['appid'], date_added=ts)
+        updated += 1
+    log.info(f'EA purchase dates: {updated} updated, {missing} games without a grant date')
+    return {'updated': updated, 'missing': missing}
+
+
 def _do_sync_library():
     from database import get_db, update_game_data as _update_game_data
     from datetime import datetime, timezone, date as _date
@@ -465,17 +568,6 @@ def _do_sync_library():
         blacklisted = {row[0] for row in db.execute(
             "SELECT platform_id FROM blacklist WHERE platform_id IS NOT NULL"
         ).fetchall()}
-
-        # Backfill grant dates for games already in the library
-        if entitlement_dates:
-            for row in existing_rows:
-                grant_ts = entitlement_dates.get(row['platform_id'])
-                if grant_ts:
-                    db.execute(
-                        "UPDATE games SET date_added=? WHERE appid=? AND date_added > ?",
-                        (grant_ts, row['appid'], grant_ts),
-                    )
-            db.commit()
     finally:
         db.close()
 

@@ -68,6 +68,18 @@ def ea_sync_cancel():
     return jsonify({'status': 'ok'})
 
 
+@bp.route('/import-purchase-dates', methods=['POST'])
+def ea_import_purchase_dates():
+    from .ea import import_purchase_dates, is_connected
+    if not is_connected():
+        return jsonify({'status': 'error', 'message': 'Connect your EA account first'}), 400
+    res = import_purchase_dates()
+    if res is None:
+        return jsonify({'status': 'error',
+                        'message': 'Could not read your EA entitlements. Reconnect EA and try again'}), 502
+    return jsonify({'status': 'success', **res})
+
+
 @bp.route('/bulk-date-import', methods=['POST'])
 def ea_bulk_date_import():
     import re

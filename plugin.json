@@ -1,7 +1,11 @@
 {
     "id": "ea_app",
     "name": "EA App",
-    "version": "1.3.0",
+    "version": "2026.10.1",
+    "release_note": {
+        "version": "2026.10.1",
+        "text": "Purchase dates are read from your EA account (new Import Purchase Dates button), no userscript needed, and the connect step rejects a bad token instead of pretending to connect."
+    },
     "min_core_version": "1.9.4",
     "platform": "ea_app",
     "author": "RobbyRatpoison",
@@ -15,8 +19,14 @@
             "type": "exe",
             "winearch": "win64",
             "win_version": "win10",
-            "winetricks": ["vcrun2022", "d3dcompiler_47", "corefonts"],
-            "env": {"EAX_LAUNCH_CLIENT": "0"},
+            "winetricks": [
+                "vcrun2022",
+                "d3dcompiler_47",
+                "corefonts"
+            ],
+            "env": {
+                "EAX_LAUNCH_CLIENT": "0"
+            },
             "exe_name": "EALauncher.exe",
             "post_install_dlls": [
                 "lib/vkd3d/x86_64-windows/libvkd3d-1.dll",

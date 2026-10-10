@@ -376,7 +376,8 @@ class EAAppPlugin:
                             'callback_endpoint': '/api/ea_app/callback',
                             'instructions': [
                                 'Click <strong>Open EA Token Page</strong> — your browser opens.',
-                                'If you are already logged in to EA, you will see a JSON response. Copy the value of <code>access_token</code> and paste it below.',
+                                'If you are signed in to EA, you will see a JSON response or be redirected to an address containing <code>access_token=</code>. Paste the whole thing (or just the token) below.',
+                                'If you see <code>login_required</code>, you are not signed in to EA in that browser.',
                                 'If you are not logged in, sign in at <a href="https://www.ea.com" target="_blank">ea.com</a> first, then click Open again.',
                             ],
                             'input_placeholder': 'Paste access_token value here',
@@ -387,6 +388,7 @@ class EAAppPlugin:
                     'connected': [
                         {'type': 'connected_label'},
                         {'type': 'button', 'label': 'Sync Library', 'action': {'type': 'call', 'fn': 'eaSync'}},
+                        {'type': 'button', 'label': 'Import Purchase Dates', 'action': {'type': 'call', 'fn': 'eaImportDates'}},
                         {'type': 'button', 'label': 'Disconnect', 'variant': 'muted', 'action': {
                             'type': 'post', 'endpoint': '/api/ea_app/disconnect',
                             'on_success': 'refresh_auth',
