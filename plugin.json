@@ -1,12 +1,12 @@
 {
     "id": "ea_app",
     "name": "EA App",
-    "version": "2026.10.1",
+    "version": "2026.10.2",
     "release_note": {
-        "version": "2026.10.1",
-        "text": "Purchase dates are read from your EA account (new Import Purchase Dates button), no userscript needed, and the connect step rejects a bad token instead of pretending to connect."
+        "version": "2026.10.2",
+        "text": "The bulk date import now reads purchase dates from your EA account instead of opening the userscript page, and Sync EA Library in the edit window also fetches the purchase date."
     },
-    "min_core_version": "1.9.4",
+    "min_core_version": "2026.10.5",
     "platform": "ea_app",
     "author": "RobbyRatpoison",
     "source": "github:RobbyRatpoison/playdate-plugin-ea-app",

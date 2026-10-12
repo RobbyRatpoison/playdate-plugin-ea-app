@@ -243,7 +243,29 @@ def ea_scrape_single(appid):
 
     update_game_data(appid, **meta)
 
+    # The purchase date too (an explicit sync of this one game, so overwriting is expected).
+    try:
+        from .ea import import_purchase_dates
+        from database import get_db
+        db = get_db()
+        try:
+            row = db.execute("SELECT platform_id FROM games WHERE appid = ?", (appid,)).fetchone()
+        finally:
+            db.close()
+        if row and import_purchase_dates({str(row['platform_id'])}):
+            db = get_db()
+            try:
+                r = db.execute("SELECT date_added FROM games WHERE appid = ?", (appid,)).fetchone()
+            finally:
+                db.close()
+            if r and r['date_added']:
+                meta['date_added'] = r['date_added']
+    except Exception as e:
+        log.warning(f'EA scrape-single: purchase date for {appid} failed: {e}')
+
     data_out = dict(meta)
+    if data_out.get('date_added'):
+        data_out['date_added'] = ts_to_date(data_out['date_added']) or ''
     if data_out.get('release_date'):
         data_out['release_date'] = ts_to_date(data_out['release_date']) or ''
     data_out.pop('_description', None)

@@ -428,7 +428,19 @@ class EAAppPlugin:
 
         return {'sections': sections}
 
-    date_import_url = 'https://myaccount.ea.com/am/ui/payment-wallet/order-history'
+    # No date_import_url: core prefers it over fetch_purchase_dates and would send the bulk date
+    # import to the userscript again.
+    def fetch_purchase_dates(self, appids, on_result):
+        from .ea import import_purchase_dates
+        from database import get_db
+        db = get_db()
+        try:
+            ph = ','.join('?' * len(appids))
+            rows = db.execute(f"SELECT platform_id FROM games WHERE platform = 'ea_app' AND appid IN ({ph})", list(appids)).fetchall()
+        finally:
+            db.close()
+        if import_purchase_dates({str(r['platform_id']) for r in rows}, on_result=on_result) is None:
+            raise RuntimeError('Could not read your EA entitlements. Reconnect EA and try again.')
 
     def fetch_description(self, appid, platform_id):
         from .ea import fetch_description

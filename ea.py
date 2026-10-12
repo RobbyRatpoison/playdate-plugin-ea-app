@@ -497,10 +497,12 @@ def _run_sync_library():
             _sync_state.update({'running': False, 'phase': 'error', 'error': str(e)})
 
 
-def import_purchase_dates():
+def import_purchase_dates(only_ids=None, on_result=None):
     """Overwrite date_added with the EA grant date for every EA game in the library.
     Returns {'updated': n, 'missing': n} or None when not connected / the request
-    failed. Sync only dates newly added games; this is the explicit re-import."""
+    failed. Sync only dates newly added games; this is the explicit re-import.
+    only_ids limits it to those platform_ids. on_result(appid, ts_or_None), when given,
+    is called per game instead of writing the date (the bulk date import writes it itself)."""
     from database import get_db, update_game_data
     session = get_valid_session()
     if not session:
@@ -513,15 +515,23 @@ def import_purchase_dates():
         rows = db.execute("SELECT appid, platform_id FROM games WHERE platform = 'ea_app'").fetchall()
     finally:
         db.close()
+    if only_ids is not None:
+        rows = [r for r in rows if str(r['platform_id']) in only_ids]
     updated = missing = 0
     for r in rows:
         ts = dates.get(r['platform_id'])
         if ts is None:
             missing += 1
+            if on_result:
+                on_result(r['appid'], None)
             continue
-        update_game_data(r['appid'], date_added=ts)
+        if on_result:
+            on_result(r['appid'], ts)
+        else:
+            update_game_data(r['appid'], date_added=ts)
         updated += 1
-    log.info(f'EA purchase dates: {updated} updated, {missing} games without a grant date')
+    if only_ids is None:
+        log.info(f'EA purchase dates: {updated} updated, {missing} games without a grant date')
     return {'updated': updated, 'missing': missing}
 
 
