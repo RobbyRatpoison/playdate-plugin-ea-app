@@ -1,10 +1,10 @@
 {
     "id": "ea_app",
     "name": "EA App",
-    "version": "2026.10.2",
+    "version": "2026.10.3",
     "release_note": {
-        "version": "2026.10.2",
-        "text": "The bulk date import now reads purchase dates from your EA account instead of opening the userscript page, and Sync EA Library in the edit window also fetches the purchase date."
+        "version": "2026.10.3",
+        "text": "New option on the plugin's card: sync your library when PlayDate starts."
     },
     "min_core_version": "2026.10.5",
     "platform": "ea_app",
